@@ -1,5 +1,4 @@
 import io
-from pathlib import Path
 import hashlib
 import hmac
 import os
@@ -48,6 +47,13 @@ BANK_MAPPINGS = {
     },
 }
 
+MIN_HEADER_MATCHES = 2
+
+
+def canonical_header(value):
+    """Normalize headers so matching is based on text only, not filename or exact casing."""
+    return " ".join(str(value).strip().upper().replace("_", " ").replace("-", " ").split())
+
 
 def read_uploaded_file(uploaded_file):
     name = uploaded_file.name.lower()
@@ -56,44 +62,74 @@ def read_uploaded_file(uploaded_file):
     return pd.read_excel(uploaded_file)
 
 
-def detect_bank(df, filename=""):
-    filename_upper = filename.upper()
-    for bank in BANK_MAPPINGS:
-        if bank in filename_upper:
-            return bank
-
-    cols = set(str(c).strip() for c in df.columns)
-    scores = {}
-    for bank, mapping in BANK_MAPPINGS.items():
-        scores[bank] = len(cols.intersection(mapping.keys()))
-    best_bank = max(scores, key=scores.get)
-    return best_bank if scores[best_bank] > 0 else None
-
-
 def normalize_columns(df):
     df = df.copy()
     df.columns = [str(c).strip() for c in df.columns]
     return df
 
 
-def consolidate_file(uploaded_file, bank_choice=None):
+def detect_bank_from_headers(df):
+    """Detect bank format only from uploaded file headers."""
+    uploaded_headers = {canonical_header(column) for column in df.columns}
+    detection_results = []
+
+    for bank, mapping in BANK_MAPPINGS.items():
+        expected_headers = {canonical_header(source_header) for source_header in mapping.keys()}
+        matched_headers = uploaded_headers.intersection(expected_headers)
+        detection_results.append(
+            {
+                "bank": bank,
+                "score": len(matched_headers),
+                "total_expected": len(expected_headers),
+                "matched_headers": sorted(matched_headers),
+            }
+        )
+
+    detection_results.sort(key=lambda item: item["score"], reverse=True)
+    best = detection_results[0]
+    tied_best = [item for item in detection_results if item["score"] == best["score"]]
+
+    if best["score"] < MIN_HEADER_MATCHES:
+        return None, detection_results, "Not enough matching headers to detect the bank."
+
+    if len(tied_best) > 1:
+        tied_names = ", ".join(item["bank"] for item in tied_best)
+        return None, detection_results, f"Bank detection is ambiguous between: {tied_names}."
+
+    return best["bank"], detection_results, None
+
+
+def build_case_insensitive_mapping(df, bank):
+    uploaded_lookup = {canonical_header(column): column for column in df.columns}
+    mapping = {}
+    missing_source_headers = []
+
+    for source_header, target_header in BANK_MAPPINGS[bank].items():
+        actual_column = uploaded_lookup.get(canonical_header(source_header))
+        if actual_column:
+            mapping[actual_column] = target_header
+        else:
+            missing_source_headers.append(source_header)
+
+    return mapping, missing_source_headers
+
+
+def consolidate_file(uploaded_file):
     raw_df = normalize_columns(read_uploaded_file(uploaded_file))
-    bank = bank_choice or detect_bank(raw_df, uploaded_file.name)
-    if not bank:
-        raise ValueError(f"Could not detect bank for {uploaded_file.name}.")
+    bank, detection_results, detection_error = detect_bank_from_headers(raw_df)
+    if detection_error:
+        raise ValueError(f"{detection_error} File: {uploaded_file.name}")
 
-    mapping = BANK_MAPPINGS[bank]
-    available_mapping = {src: dest for src, dest in mapping.items() if src in raw_df.columns}
-    missing_source_headers = [src for src in mapping if src not in raw_df.columns]
+    mapping, missing_source_headers = build_case_insensitive_mapping(raw_df, bank)
+    renamed = raw_df.rename(columns=mapping)
 
-    renamed = raw_df.rename(columns=available_mapping)
     output = pd.DataFrame()
     for header in MAIN_HEADERS:
         output[header] = renamed[header] if header in renamed.columns else pd.NA
 
     output.insert(0, "Bank", bank)
     output.insert(1, "Source File", uploaded_file.name)
-    return output, missing_source_headers
+    return output, missing_source_headers, detection_results
 
 
 def to_excel_bytes(df):
@@ -117,7 +153,6 @@ def to_excel_bytes(df):
             idx = df.columns.get_loc("Posting Date")
             worksheet.set_column(idx, idx, 15, date_fmt)
     return buffer.getvalue()
-
 
 
 def get_config_value(key, default=None):
@@ -169,7 +204,7 @@ if not require_login():
     st.stop()
 
 st.title("Bank Statement Consolidator")
-st.write("Upload bank statement files and consolidate them into the standard headers.")
+st.write("Upload bank statement files. The app detects the bank format from headers only, consolidates the rows, and prepares the download.")
 
 with st.expander("Current standard headers and bank mappings", expanded=False):
     st.write("Main headers:", MAIN_HEADERS)
@@ -179,20 +214,25 @@ uploaded_files = st.file_uploader(
     "Upload bank files", type=["xlsx", "xls", "csv"], accept_multiple_files=True
 )
 
-manual_bank = st.selectbox(
-    "Optional: force bank format for all uploaded files",
-    ["Auto-detect"] + list(BANK_MAPPINGS.keys()),
-)
-
 if uploaded_files:
     consolidated_frames = []
     issues = []
-    bank_choice = None if manual_bank == "Auto-detect" else manual_bank
+    detection_summary = []
 
     for file in uploaded_files:
         try:
-            frame, missing = consolidate_file(file, bank_choice)
+            frame, missing, detection_results = consolidate_file(file)
             consolidated_frames.append(frame)
+            detected_bank = frame["Bank"].iloc[0]
+            detection_summary.append(
+                {
+                    "file": file.name,
+                    "detected_bank": detected_bank,
+                    "matched_headers": next(
+                        item["score"] for item in detection_results if item["bank"] == detected_bank
+                    ),
+                }
+            )
             if missing:
                 issues.append({"file": file.name, "missing source headers": missing})
         except Exception as exc:
@@ -200,19 +240,26 @@ if uploaded_files:
 
     if consolidated_frames:
         consolidated = pd.concat(consolidated_frames, ignore_index=True)
-        st.success(f"Consolidated {len(consolidated_frames)} file(s), {len(consolidated):,} row(s).")
-        st.dataframe(consolidated, use_container_width=True)
-
         excel_bytes = to_excel_bytes(consolidated)
+
+        st.success(f"Consolidated {len(consolidated_frames)} file(s), {len(consolidated):,} row(s). Your download is ready.")
         st.download_button(
-            "Download consolidated Excel",
+            "⬇️ Download consolidated Excel",
             data=excel_bytes,
             file_name="consolidated_bank_statements.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            type="primary",
+            use_container_width=True,
         )
 
+        with st.expander("Preview consolidated data", expanded=True):
+            st.dataframe(consolidated, use_container_width=True)
+
+        with st.expander("Bank detection summary", expanded=False):
+            st.json(detection_summary)
+
     if issues:
-        st.warning("Review these mapping issues:")
+        st.warning("Review these mapping or detection issues:")
         st.json(issues)
 else:
     st.info("Upload one or more bank statement files to start.")
