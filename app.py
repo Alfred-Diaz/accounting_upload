@@ -16,7 +16,6 @@ MAIN_HEADERS = [
     "Check Number",
 ]
 
-# Bank-specific header names mapped to the main headers above.
 BANK_MAPPINGS = {
     "METROBANK": {
         "Posting Date": "Posting Date",
@@ -47,11 +46,15 @@ BANK_MAPPINGS = {
     },
 }
 
+ACCOUNT_CODES = {
+    "BDO MAIN": "709",
+    "METROBANK": "253",
+}
+
 MIN_HEADER_MATCHES = 2
 
 
 def canonical_header(value):
-    """Normalize headers so matching is based on text only, not filename or exact casing."""
     return " ".join(str(value).strip().upper().replace("_", " ").replace("-", " ").split())
 
 
@@ -69,7 +72,6 @@ def normalize_columns(df):
 
 
 def detect_bank_from_headers(df):
-    """Detect bank format only from uploaded file headers."""
     uploaded_headers = {canonical_header(column) for column in df.columns}
     detection_results = []
 
@@ -97,6 +99,19 @@ def detect_bank_from_headers(df):
         return None, detection_results, f"Bank detection is ambiguous between: {tied_names}."
 
     return best["bank"], detection_results, None
+
+
+def detect_account_from_filename(filename, bank):
+    upper_name = filename.upper()
+    if "709" in upper_name or "BDO MAIN" in upper_name:
+        return "BDO MAIN", "709"
+    if "253" in upper_name or "METROBANK" in upper_name:
+        return "METROBANK", "253"
+    if bank == "BDO":
+        return "BDO MAIN", "709"
+    if bank == "METROBANK":
+        return "METROBANK", "253"
+    return bank, ""
 
 
 def build_case_insensitive_mapping(df, bank):
@@ -127,36 +142,63 @@ def consolidate_file(uploaded_file):
     for header in MAIN_HEADERS:
         output[header] = renamed[header] if header in renamed.columns else pd.NA
 
+    account_name, account_code = detect_account_from_filename(uploaded_file.name, bank)
     output.insert(0, "Bank", bank)
-    output.insert(1, "Source File", uploaded_file.name)
+    output.insert(1, "Account Name", account_name)
+    output.insert(2, "Account Code", account_code)
+    output.insert(3, "Source File", uploaded_file.name)
     return output, missing_source_headers, detection_results
 
 
-def to_excel_bytes(df):
+def prepare_accounting_fields(df):
+    df = df.copy()
+    df["Posting Date"] = pd.to_datetime(df["Posting Date"], errors="coerce")
+    for col in ["Debit", "Credit", "Running Balance"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+    df["Month"] = df["Posting Date"].dt.to_period("M").astype(str)
+    df["Check Number"] = df["Check Number"].fillna("").astype(str).str.strip()
+    df["Description"] = df["Description"].fillna("").astype(str)
+    return df
+
+
+def filter_text(df, columns, query):
+    if not query:
+        return df
+    mask = pd.Series(False, index=df.index)
+    query = str(query).strip().lower()
+    for col in columns:
+        if col in df.columns:
+            mask = mask | df[col].fillna("").astype(str).str.lower().str.contains(query, na=False, regex=False)
+    return df[mask]
+
+
+def to_excel_bytes(sheets):
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
-        df.to_excel(writer, index=False, sheet_name="Consolidated")
         workbook = writer.book
-        worksheet = writer.sheets["Consolidated"]
         header_fmt = workbook.add_format({"bold": True, "bg_color": "#D9EAF7", "border": 1})
         money_fmt = workbook.add_format({"num_format": "#,##0.00"})
         date_fmt = workbook.add_format({"num_format": "yyyy-mm-dd"})
-        for col_num, col_name in enumerate(df.columns):
-            worksheet.write(0, col_num, col_name, header_fmt)
-            width = max(12, min(35, len(str(col_name)) + 4))
-            worksheet.set_column(col_num, col_num, width)
-        for col in ["Debit", "Credit", "Running Balance"]:
-            if col in df.columns:
-                idx = df.columns.get_loc(col)
-                worksheet.set_column(idx, idx, 16, money_fmt)
-        if "Posting Date" in df.columns:
-            idx = df.columns.get_loc("Posting Date")
-            worksheet.set_column(idx, idx, 15, date_fmt)
+
+        for sheet_name, df in sheets.items():
+            safe_sheet_name = sheet_name[:31]
+            df.to_excel(writer, index=False, sheet_name=safe_sheet_name)
+            worksheet = writer.sheets[safe_sheet_name]
+            for col_num, col_name in enumerate(df.columns):
+                worksheet.write(0, col_num, col_name, header_fmt)
+                width = max(12, min(35, len(str(col_name)) + 4))
+                worksheet.set_column(col_num, col_num, width)
+            for col in ["Debit", "Credit", "Running Balance", "Total Debit", "Total Credit", "Ending Balance", "Net Movement"]:
+                if col in df.columns:
+                    idx = df.columns.get_loc(col)
+                    worksheet.set_column(idx, idx, 16, money_fmt)
+            if "Posting Date" in df.columns:
+                idx = df.columns.get_loc("Posting Date")
+                worksheet.set_column(idx, idx, 15, date_fmt)
     return buffer.getvalue()
 
 
 def get_config_value(key, default=None):
-    """Read configuration from Streamlit secrets first, then environment variables."""
     try:
         if key in st.secrets:
             return st.secrets[key]
@@ -181,7 +223,7 @@ def require_login():
                 st.rerun()
         return True
 
-    st.title("Bank Statement Consolidator")
+    st.title("Accounting System")
     st.write("Please sign in to continue.")
     with st.form("login_form"):
         username = st.text_input("Username")
@@ -198,16 +240,17 @@ def require_login():
     return False
 
 
-st.set_page_config(page_title="Bank Statement Consolidator", layout="wide")
+st.set_page_config(page_title="Accounting System", layout="wide")
 
 if not require_login():
     st.stop()
 
-st.title("Bank Statement Consolidator")
-st.write("Upload bank statement files. The app detects the bank format from headers only, consolidates the rows, and prepares the download.")
+st.title("Accounting System")
+st.write("Upload bank statement files once, then use Bank Consolidation, Payment Verification, and Bank Recon tabs.")
 
 with st.expander("Current standard headers and bank mappings", expanded=False):
     st.write("Main headers:", MAIN_HEADERS)
+    st.write("Payment verification account codes:", ACCOUNT_CODES)
     st.json(BANK_MAPPINGS)
 
 uploaded_files = st.file_uploader(
@@ -228,9 +271,9 @@ if uploaded_files:
                 {
                     "file": file.name,
                     "detected_bank": detected_bank,
-                    "matched_headers": next(
-                        item["score"] for item in detection_results if item["bank"] == detected_bank
-                    ),
+                    "account_name": frame["Account Name"].iloc[0],
+                    "account_code": frame["Account Code"].iloc[0],
+                    "matched_headers": next(item["score"] for item in detection_results if item["bank"] == detected_bank),
                 }
             )
             if missing:
@@ -239,21 +282,120 @@ if uploaded_files:
             issues.append({"file": file.name, "error": str(exc)})
 
     if consolidated_frames:
-        consolidated = pd.concat(consolidated_frames, ignore_index=True)
-        excel_bytes = to_excel_bytes(consolidated)
+        consolidated = prepare_accounting_fields(pd.concat(consolidated_frames, ignore_index=True))
+        credit_summary = consolidated[consolidated["Credit"] > 0].copy()
+        check_tracking = consolidated[consolidated["Check Number"] != ""].copy()
+        recon_summary = (
+            consolidated.groupby(["Bank", "Account Name", "Account Code", "Month"], dropna=False)
+            .agg(
+                Transactions=("Source File", "count"),
+                Total_Debit=("Debit", "sum"),
+                Total_Credit=("Credit", "sum"),
+                Ending_Balance=("Running Balance", "last"),
+            )
+            .reset_index()
+            .rename(columns={"Total_Debit": "Total Debit", "Total_Credit": "Total Credit", "Ending_Balance": "Ending Balance"})
+        )
+        recon_summary["Net Movement"] = recon_summary["Total Credit"] - recon_summary["Total Debit"]
 
-        st.success(f"Consolidated {len(consolidated_frames)} file(s), {len(consolidated):,} row(s). Your download is ready.")
+        full_workbook = to_excel_bytes(
+            {
+                "Consolidated": consolidated,
+                "Payment Verification": credit_summary,
+                "Check Tracking": check_tracking,
+                "Bank Recon": recon_summary,
+            }
+        )
+
+        st.success(f"Processed {len(consolidated_frames)} file(s), {len(consolidated):,} row(s). Your accounting workbook is ready.")
         st.download_button(
-            "⬇️ Download consolidated Excel",
-            data=excel_bytes,
-            file_name="consolidated_bank_statements.xlsx",
+            "⬇️ Download full accounting workbook",
+            data=full_workbook,
+            file_name="accounting_bank_workbook.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             type="primary",
             use_container_width=True,
         )
 
-        with st.expander("Preview consolidated data", expanded=True):
+        tab1, tab2, tab3, tab4 = st.tabs([
+            "Bank Consolidation",
+            "Check No. Tracking",
+            "Payment Verification",
+            "Bank Recon",
+        ])
+
+        with tab1:
+            st.subheader("Bank Consolidation")
             st.dataframe(consolidated, use_container_width=True)
+            st.download_button(
+                "Download consolidated only",
+                data=to_excel_bytes({"Consolidated": consolidated}),
+                file_name="bank_consolidated.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+
+        with tab2:
+            st.subheader("Check No. Tracking")
+            check_query = st.text_input("Search by check number, description, source file, or bank", key="check_query")
+            check_result = filter_text(check_tracking, ["Check Number", "Description", "Source File", "Bank", "Account Code"], check_query)
+            st.caption(f"Showing {len(check_result):,} check transaction(s).")
+            st.dataframe(check_result, use_container_width=True)
+            st.download_button(
+                "Download check tracking result",
+                data=to_excel_bytes({"Check Tracking": check_result}),
+                file_name="check_no_tracking.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+
+        with tab3:
+            st.subheader("Payment Verification")
+            st.write("Credit-side transactions only. BDO MAIN uses account code 709; METROBANK uses account code 253, detected from the filename when available.")
+            account_options = ["All"] + sorted([x for x in credit_summary["Account Code"].dropna().unique().tolist() if str(x) != ""])
+            selected_account = st.selectbox("Account code", account_options)
+            payment_query = st.text_input("Search credit transactions by amount, description, source file, bank, or account", key="payment_query")
+            payment_result = credit_summary.copy()
+            if selected_account != "All":
+                payment_result = payment_result[payment_result["Account Code"].astype(str) == str(selected_account)]
+            if payment_query:
+                amount_mask = payment_result["Credit"].astype(str).str.contains(payment_query, na=False, regex=False)
+                text_result = filter_text(payment_result, ["Description", "Source File", "Bank", "Account Name", "Account Code"], payment_query)
+                payment_result = payment_result[amount_mask | payment_result.index.isin(text_result.index)]
+            st.metric("Total credits found", f"{payment_result['Credit'].sum():,.2f}")
+            st.caption(f"Showing {len(payment_result):,} credit transaction(s).")
+            st.dataframe(payment_result, use_container_width=True)
+            st.download_button(
+                "Download payment verification result",
+                data=to_excel_bytes({"Payment Verification": payment_result}),
+                file_name="payment_verification.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+
+        with tab4:
+            st.subheader("Bank Recon")
+            st.write("Consolidated per bank and per month.")
+            bank_options = ["All"] + sorted(consolidated["Bank"].dropna().unique().tolist())
+            month_options = ["All"] + sorted(consolidated["Month"].dropna().unique().tolist())
+            col1, col2 = st.columns(2)
+            with col1:
+                selected_bank = st.selectbox("Bank", bank_options)
+            with col2:
+                selected_month = st.selectbox("Month", month_options)
+            recon_result = recon_summary.copy()
+            if selected_bank != "All":
+                recon_result = recon_result[recon_result["Bank"] == selected_bank]
+            if selected_month != "All":
+                recon_result = recon_result[recon_result["Month"] == selected_month]
+            st.dataframe(recon_result, use_container_width=True)
+            st.download_button(
+                "Download bank recon result",
+                data=to_excel_bytes({"Bank Recon": recon_result}),
+                file_name="bank_recon.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
 
         with st.expander("Bank detection summary", expanded=False):
             st.json(detection_summary)
