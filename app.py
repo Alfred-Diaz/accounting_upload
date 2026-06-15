@@ -1,10 +1,15 @@
-import io
 import hashlib
 import hmac
+import io
 import os
+from datetime import datetime
 
 import pandas as pd
-import streamlit as st
+from flask import Flask, redirect, render_template, request, send_file, session, url_for
+from werkzeug.utils import secure_filename
+
+app = Flask(__name__)
+app.secret_key = os.getenv("FLASK_SECRET_KEY", "change-this-local-secret-key")
 
 MAIN_HEADERS = [
     "Posting Date",
@@ -52,17 +57,42 @@ ACCOUNT_CODES = {
 }
 
 MIN_HEADER_MATCHES = 2
+DATA_STORE = {}
+ALLOWED_EXTENSIONS = {"xlsx", "xls", "csv"}
+
+
+def allowed_file(filename):
+    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
 
 
 def canonical_header(value):
     return " ".join(str(value).strip().upper().replace("_", " ").replace("-", " ").split())
 
 
-def read_uploaded_file(uploaded_file):
-    name = uploaded_file.name.lower()
-    if name.endswith(".csv"):
-        return pd.read_csv(uploaded_file)
-    return pd.read_excel(uploaded_file)
+def get_config_value(key, default=None):
+    return os.getenv(key, default)
+
+
+def check_password(username, password):
+    configured_user = get_config_value("APP_USERNAME", "Accounting")
+    configured_hash = get_config_value(
+        "APP_PASSWORD_SHA256",
+        "008c70392e3abfbd0fa47bbc2ed96aa99bd49e159727fcba0f2e6abeb3a9d601",
+    )
+    password_hash = hashlib.sha256(password.encode("utf-8")).hexdigest()
+    return hmac.compare_digest(username, configured_user) and hmac.compare_digest(password_hash, configured_hash)
+
+
+def login_required():
+    return session.get("authenticated") is True
+
+
+def read_uploaded_file(file_storage):
+    filename = file_storage.filename.lower()
+    file_storage.stream.seek(0)
+    if filename.endswith(".csv"):
+        return pd.read_csv(file_storage)
+    return pd.read_excel(file_storage)
 
 
 def normalize_columns(df):
@@ -129,11 +159,12 @@ def build_case_insensitive_mapping(df, bank):
     return mapping, missing_source_headers
 
 
-def consolidate_file(uploaded_file):
-    raw_df = normalize_columns(read_uploaded_file(uploaded_file))
+def consolidate_file(file_storage):
+    filename = secure_filename(file_storage.filename)
+    raw_df = normalize_columns(read_uploaded_file(file_storage))
     bank, detection_results, detection_error = detect_bank_from_headers(raw_df)
     if detection_error:
-        raise ValueError(f"{detection_error} File: {uploaded_file.name}")
+        raise ValueError(f"{detection_error} File: {filename}")
 
     mapping, missing_source_headers = build_case_insensitive_mapping(raw_df, bank)
     renamed = raw_df.rename(columns=mapping)
@@ -142,11 +173,11 @@ def consolidate_file(uploaded_file):
     for header in MAIN_HEADERS:
         output[header] = renamed[header] if header in renamed.columns else pd.NA
 
-    account_name, account_code = detect_account_from_filename(uploaded_file.name, bank)
+    account_name, account_code = detect_account_from_filename(filename, bank)
     output.insert(0, "Bank", bank)
     output.insert(1, "Account Name", account_name)
     output.insert(2, "Account Code", account_code)
-    output.insert(3, "Source File", uploaded_file.name)
+    output.insert(3, "Source File", filename)
     return output, missing_source_headers, detection_results
 
 
@@ -172,6 +203,30 @@ def filter_text(df, columns, query):
     return df[mask]
 
 
+def build_reports(consolidated):
+    credit_summary = consolidated[consolidated["Credit"] > 0].copy()
+    check_tracking = consolidated[consolidated["Check Number"] != ""].copy()
+    recon_summary = (
+        consolidated.groupby(["Bank", "Account Name", "Account Code", "Month"], dropna=False)
+        .agg(
+            Transactions=("Source File", "count"),
+            Total_Debit=("Debit", "sum"),
+            Total_Credit=("Credit", "sum"),
+            Ending_Balance=("Running Balance", "last"),
+        )
+        .reset_index()
+        .rename(
+            columns={
+                "Total_Debit": "Total Debit",
+                "Total_Credit": "Total Credit",
+                "Ending_Balance": "Ending Balance",
+            }
+        )
+    )
+    recon_summary["Net Movement"] = recon_summary["Total Credit"] - recon_summary["Total Debit"]
+    return credit_summary, check_tracking, recon_summary
+
+
 def to_excel_bytes(sheets):
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
@@ -182,226 +237,262 @@ def to_excel_bytes(sheets):
 
         for sheet_name, df in sheets.items():
             safe_sheet_name = sheet_name[:31]
-            df.to_excel(writer, index=False, sheet_name=safe_sheet_name)
+            export_df = df.copy()
+            if "Posting Date" in export_df.columns:
+                export_df["Posting Date"] = pd.to_datetime(export_df["Posting Date"], errors="coerce")
+            export_df.to_excel(writer, index=False, sheet_name=safe_sheet_name)
             worksheet = writer.sheets[safe_sheet_name]
-            for col_num, col_name in enumerate(df.columns):
+            for col_num, col_name in enumerate(export_df.columns):
                 worksheet.write(0, col_num, col_name, header_fmt)
                 width = max(12, min(35, len(str(col_name)) + 4))
                 worksheet.set_column(col_num, col_num, width)
             for col in ["Debit", "Credit", "Running Balance", "Total Debit", "Total Credit", "Ending Balance", "Net Movement"]:
-                if col in df.columns:
-                    idx = df.columns.get_loc(col)
+                if col in export_df.columns:
+                    idx = export_df.columns.get_loc(col)
                     worksheet.set_column(idx, idx, 16, money_fmt)
-            if "Posting Date" in df.columns:
-                idx = df.columns.get_loc("Posting Date")
+            if "Posting Date" in export_df.columns:
+                idx = export_df.columns.get_loc("Posting Date")
                 worksheet.set_column(idx, idx, 15, date_fmt)
-    return buffer.getvalue()
+    buffer.seek(0)
+    return buffer
 
 
-def get_config_value(key, default=None):
-    try:
-        if key in st.secrets:
-            return st.secrets[key]
-    except Exception:
-        pass
-    return os.getenv(key, default)
+def df_to_records(df, limit=500):
+    view = df.head(limit).copy()
+    for col in view.columns:
+        if pd.api.types.is_datetime64_any_dtype(view[col]):
+            view[col] = view[col].dt.strftime("%Y-%m-%d").fillna("")
+    return view.fillna("").to_dict(orient="records"), list(view.columns)
 
 
-def check_password(username, password):
-    configured_user = get_config_value("APP_USERNAME", "Accounting")
-    configured_hash = get_config_value("APP_PASSWORD_SHA256", "008c70392e3abfbd0fa47bbc2ed96aa99bd49e159727fcba0f2e6abeb3a9d601")
-    password_hash = hashlib.sha256(password.encode("utf-8")).hexdigest()
-    return hmac.compare_digest(username, configured_user) and hmac.compare_digest(password_hash, configured_hash)
+def current_dataset():
+    dataset_id = session.get("dataset_id")
+    if not dataset_id:
+        return None
+    return DATA_STORE.get(dataset_id)
 
 
-def require_login():
-    if st.session_state.get("authenticated"):
-        with st.sidebar:
-            st.success(f"Signed in as {st.session_state.get('username', 'user')}")
-            if st.button("Log out"):
-                st.session_state.clear()
-                st.rerun()
-        return True
-
-    st.title("Accounting System")
-    st.write("Please sign in to continue.")
-    with st.form("login_form"):
-        username = st.text_input("Username")
-        password = st.text_input("Password", type="password")
-        submitted = st.form_submit_button("Sign in")
-
-    if submitted:
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    error = None
+    if request.method == "POST":
+        username = request.form.get("username", "")
+        password = request.form.get("password", "")
         if check_password(username, password):
-            st.session_state["authenticated"] = True
-            st.session_state["username"] = username
-            st.rerun()
-        else:
-            st.error("Invalid username or password.")
-    return False
+            session["authenticated"] = True
+            session["username"] = username
+            return redirect(url_for("index"))
+        error = "Invalid username or password."
+    return render_template("login.html", error=error)
 
 
-st.set_page_config(page_title="Accounting System", layout="wide")
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
 
-if not require_login():
-    st.stop()
 
-st.title("Accounting System")
-st.write("Upload bank statement files once, then use Bank Consolidation, Payment Verification, and Bank Recon tabs.")
+@app.route("/", methods=["GET", "POST"])
+def index():
+    if not login_required():
+        return redirect(url_for("login"))
 
-with st.expander("Current standard headers and bank mappings", expanded=False):
-    st.write("Main headers:", MAIN_HEADERS)
-    st.write("Payment verification account codes:", ACCOUNT_CODES)
-    st.json(BANK_MAPPINGS)
-
-uploaded_files = st.file_uploader(
-    "Upload bank files", type=["xlsx", "xls", "csv"], accept_multiple_files=True
-)
-
-if uploaded_files:
-    consolidated_frames = []
-    issues = []
+    errors = []
     detection_summary = []
 
-    for file in uploaded_files:
-        try:
-            frame, missing, detection_results = consolidate_file(file)
-            consolidated_frames.append(frame)
-            detected_bank = frame["Bank"].iloc[0]
-            detection_summary.append(
-                {
-                    "file": file.name,
-                    "detected_bank": detected_bank,
-                    "account_name": frame["Account Name"].iloc[0],
-                    "account_code": frame["Account Code"].iloc[0],
-                    "matched_headers": next(item["score"] for item in detection_results if item["bank"] == detected_bank),
-                }
-            )
-            if missing:
-                issues.append({"file": file.name, "missing source headers": missing})
-        except Exception as exc:
-            issues.append({"file": file.name, "error": str(exc)})
+    if request.method == "POST":
+        files = request.files.getlist("files")
+        consolidated_frames = []
+        for file_storage in files:
+            if not file_storage or not file_storage.filename:
+                continue
+            if not allowed_file(file_storage.filename):
+                errors.append({"file": file_storage.filename, "error": "Unsupported file type."})
+                continue
+            try:
+                frame, missing, detection_results = consolidate_file(file_storage)
+                consolidated_frames.append(frame)
+                detected_bank = frame["Bank"].iloc[0]
+                detection_summary.append(
+                    {
+                        "file": secure_filename(file_storage.filename),
+                        "detected_bank": detected_bank,
+                        "account_name": frame["Account Name"].iloc[0],
+                        "account_code": frame["Account Code"].iloc[0],
+                        "matched_headers": next(item["score"] for item in detection_results if item["bank"] == detected_bank),
+                    }
+                )
+                if missing:
+                    errors.append({"file": file_storage.filename, "warning": f"Missing source headers: {', '.join(missing)}"})
+            except Exception as exc:
+                errors.append({"file": file_storage.filename, "error": str(exc)})
 
-    if consolidated_frames:
-        consolidated = prepare_accounting_fields(pd.concat(consolidated_frames, ignore_index=True))
-        credit_summary = consolidated[consolidated["Credit"] > 0].copy()
-        check_tracking = consolidated[consolidated["Check Number"] != ""].copy()
-        recon_summary = (
-            consolidated.groupby(["Bank", "Account Name", "Account Code", "Month"], dropna=False)
-            .agg(
-                Transactions=("Source File", "count"),
-                Total_Debit=("Debit", "sum"),
-                Total_Credit=("Credit", "sum"),
-                Ending_Balance=("Running Balance", "last"),
-            )
-            .reset_index()
-            .rename(columns={"Total_Debit": "Total Debit", "Total_Credit": "Total Credit", "Ending_Balance": "Ending Balance"})
-        )
-        recon_summary["Net Movement"] = recon_summary["Total Credit"] - recon_summary["Total Debit"]
-
-        full_workbook = to_excel_bytes(
-            {
-                "Consolidated": consolidated,
-                "Payment Verification": credit_summary,
-                "Check Tracking": check_tracking,
-                "Bank Recon": recon_summary,
+        if consolidated_frames:
+            consolidated = prepare_accounting_fields(pd.concat(consolidated_frames, ignore_index=True))
+            credit_summary, check_tracking, recon_summary = build_reports(consolidated)
+            dataset_id = datetime.now().strftime("%Y%m%d%H%M%S%f")
+            DATA_STORE[dataset_id] = {
+                "consolidated": consolidated,
+                "credit_summary": credit_summary,
+                "check_tracking": check_tracking,
+                "recon_summary": recon_summary,
+                "detection_summary": detection_summary,
+                "errors": errors,
             }
-        )
+            session["dataset_id"] = dataset_id
+            return redirect(url_for("index"))
 
-        st.success(f"Processed {len(consolidated_frames)} file(s), {len(consolidated):,} row(s). Your accounting workbook is ready.")
-        st.download_button(
-            "⬇️ Download full accounting workbook",
-            data=full_workbook,
-            file_name="accounting_bank_workbook.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            type="primary",
-            use_container_width=True,
-        )
+    dataset = current_dataset()
+    consolidated = dataset["consolidated"] if dataset else pd.DataFrame()
+    rows, columns = df_to_records(consolidated, 200) if dataset else ([], [])
+    return render_template(
+        "index.html",
+        username=session.get("username"),
+        dataset=dataset,
+        rows=rows,
+        columns=columns,
+        errors=dataset.get("errors", errors) if dataset else errors,
+        detection_summary=dataset.get("detection_summary", detection_summary) if dataset else detection_summary,
+    )
 
-        tab1, tab2, tab3, tab4 = st.tabs([
-            "Bank Consolidation",
-            "Check No. Tracking",
-            "Payment Verification",
-            "Bank Recon",
-        ])
 
-        with tab1:
-            st.subheader("Bank Consolidation")
-            st.dataframe(consolidated, use_container_width=True)
-            st.download_button(
-                "Download consolidated only",
-                data=to_excel_bytes({"Consolidated": consolidated}),
-                file_name="bank_consolidated.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-            )
+@app.route("/checks")
+def checks():
+    if not login_required():
+        return redirect(url_for("login"))
+    dataset = current_dataset()
+    if not dataset:
+        return redirect(url_for("index"))
+    query = request.args.get("q", "")
+    result = filter_text(dataset["check_tracking"], ["Check Number", "Description", "Source File", "Bank", "Account Code"], query)
+    rows, columns = df_to_records(result, 500)
+    return render_template("table.html", title="Check No. Tracking", rows=rows, columns=columns, query=query, download_endpoint="download_checks")
 
-        with tab2:
-            st.subheader("Check No. Tracking")
-            check_query = st.text_input("Search by check number, description, source file, or bank", key="check_query")
-            check_result = filter_text(check_tracking, ["Check Number", "Description", "Source File", "Bank", "Account Code"], check_query)
-            st.caption(f"Showing {len(check_result):,} check transaction(s).")
-            st.dataframe(check_result, use_container_width=True)
-            st.download_button(
-                "Download check tracking result",
-                data=to_excel_bytes({"Check Tracking": check_result}),
-                file_name="check_no_tracking.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-            )
 
-        with tab3:
-            st.subheader("Payment Verification")
-            st.write("Credit-side transactions only. BDO MAIN uses account code 709; METROBANK uses account code 253, detected from the filename when available.")
-            account_options = ["All"] + sorted([x for x in credit_summary["Account Code"].dropna().unique().tolist() if str(x) != ""])
-            selected_account = st.selectbox("Account code", account_options)
-            payment_query = st.text_input("Search credit transactions by amount, description, source file, bank, or account", key="payment_query")
-            payment_result = credit_summary.copy()
-            if selected_account != "All":
-                payment_result = payment_result[payment_result["Account Code"].astype(str) == str(selected_account)]
-            if payment_query:
-                amount_mask = payment_result["Credit"].astype(str).str.contains(payment_query, na=False, regex=False)
-                text_result = filter_text(payment_result, ["Description", "Source File", "Bank", "Account Name", "Account Code"], payment_query)
-                payment_result = payment_result[amount_mask | payment_result.index.isin(text_result.index)]
-            st.metric("Total credits found", f"{payment_result['Credit'].sum():,.2f}")
-            st.caption(f"Showing {len(payment_result):,} credit transaction(s).")
-            st.dataframe(payment_result, use_container_width=True)
-            st.download_button(
-                "Download payment verification result",
-                data=to_excel_bytes({"Payment Verification": payment_result}),
-                file_name="payment_verification.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-            )
+@app.route("/payments")
+def payments():
+    if not login_required():
+        return redirect(url_for("login"))
+    dataset = current_dataset()
+    if not dataset:
+        return redirect(url_for("index"))
+    query = request.args.get("q", "")
+    account_code = request.args.get("account_code", "All")
+    result = dataset["credit_summary"].copy()
+    if account_code != "All":
+        result = result[result["Account Code"].astype(str) == str(account_code)]
+    if query:
+        amount_mask = result["Credit"].astype(str).str.contains(query, na=False, regex=False)
+        text_result = filter_text(result, ["Description", "Source File", "Bank", "Account Name", "Account Code"], query)
+        result = result[amount_mask | result.index.isin(text_result.index)]
+    account_codes = ["All"] + sorted([str(x) for x in dataset["credit_summary"]["Account Code"].dropna().unique().tolist() if str(x) != ""])
+    rows, columns = df_to_records(result, 500)
+    return render_template(
+        "payments.html",
+        rows=rows,
+        columns=columns,
+        query=query,
+        account_code=account_code,
+        account_codes=account_codes,
+        total_credit=result["Credit"].sum(),
+    )
 
-        with tab4:
-            st.subheader("Bank Recon")
-            st.write("Consolidated per bank and per month.")
-            bank_options = ["All"] + sorted(consolidated["Bank"].dropna().unique().tolist())
-            month_options = ["All"] + sorted(consolidated["Month"].dropna().unique().tolist())
-            col1, col2 = st.columns(2)
-            with col1:
-                selected_bank = st.selectbox("Bank", bank_options)
-            with col2:
-                selected_month = st.selectbox("Month", month_options)
-            recon_result = recon_summary.copy()
-            if selected_bank != "All":
-                recon_result = recon_result[recon_result["Bank"] == selected_bank]
-            if selected_month != "All":
-                recon_result = recon_result[recon_result["Month"] == selected_month]
-            st.dataframe(recon_result, use_container_width=True)
-            st.download_button(
-                "Download bank recon result",
-                data=to_excel_bytes({"Bank Recon": recon_result}),
-                file_name="bank_recon.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-            )
 
-        with st.expander("Bank detection summary", expanded=False):
-            st.json(detection_summary)
+@app.route("/recon")
+def recon():
+    if not login_required():
+        return redirect(url_for("login"))
+    dataset = current_dataset()
+    if not dataset:
+        return redirect(url_for("index"))
+    bank = request.args.get("bank", "All")
+    month = request.args.get("month", "All")
+    result = dataset["recon_summary"].copy()
+    if bank != "All":
+        result = result[result["Bank"] == bank]
+    if month != "All":
+        result = result[result["Month"] == month]
+    banks = ["All"] + sorted(dataset["consolidated"]["Bank"].dropna().unique().tolist())
+    months = ["All"] + sorted(dataset["consolidated"]["Month"].dropna().unique().tolist())
+    rows, columns = df_to_records(result, 500)
+    return render_template("recon.html", rows=rows, columns=columns, bank=bank, month=month, banks=banks, months=months)
 
-    if issues:
-        st.warning("Review these mapping or detection issues:")
-        st.json(issues)
-else:
-    st.info("Upload one or more bank statement files to start.")
+
+def download_excel(sheets, filename):
+    output = to_excel_bytes(sheets)
+    return send_file(
+        output,
+        as_attachment=True,
+        download_name=filename,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+
+@app.route("/download/full")
+def download_full():
+    dataset = current_dataset()
+    if not dataset:
+        return redirect(url_for("index"))
+    return download_excel(
+        {
+            "Consolidated": dataset["consolidated"],
+            "Payment Verification": dataset["credit_summary"],
+            "Check Tracking": dataset["check_tracking"],
+            "Bank Recon": dataset["recon_summary"],
+        },
+        "accounting_bank_workbook.xlsx",
+    )
+
+
+@app.route("/download/consolidated")
+def download_consolidated():
+    dataset = current_dataset()
+    if not dataset:
+        return redirect(url_for("index"))
+    return download_excel({"Consolidated": dataset["consolidated"]}, "bank_consolidated.xlsx")
+
+
+@app.route("/download/checks")
+def download_checks():
+    dataset = current_dataset()
+    if not dataset:
+        return redirect(url_for("index"))
+    query = request.args.get("q", "")
+    result = filter_text(dataset["check_tracking"], ["Check Number", "Description", "Source File", "Bank", "Account Code"], query)
+    return download_excel({"Check Tracking": result}, "check_no_tracking.xlsx")
+
+
+@app.route("/download/payments")
+def download_payments():
+    dataset = current_dataset()
+    if not dataset:
+        return redirect(url_for("index"))
+    query = request.args.get("q", "")
+    account_code = request.args.get("account_code", "All")
+    result = dataset["credit_summary"].copy()
+    if account_code != "All":
+        result = result[result["Account Code"].astype(str) == str(account_code)]
+    if query:
+        amount_mask = result["Credit"].astype(str).str.contains(query, na=False, regex=False)
+        text_result = filter_text(result, ["Description", "Source File", "Bank", "Account Name", "Account Code"], query)
+        result = result[amount_mask | result.index.isin(text_result.index)]
+    return download_excel({"Payment Verification": result}, "payment_verification.xlsx")
+
+
+@app.route("/download/recon")
+def download_recon():
+    dataset = current_dataset()
+    if not dataset:
+        return redirect(url_for("index"))
+    bank = request.args.get("bank", "All")
+    month = request.args.get("month", "All")
+    result = dataset["recon_summary"].copy()
+    if bank != "All":
+        result = result[result["Bank"] == bank]
+    if month != "All":
+        result = result[result["Month"] == month]
+    return download_excel({"Bank Recon": result}, "bank_recon.xlsx")
+
+
+if __name__ == "__main__":
+    app.run(host="127.0.0.1", port=5000, debug=True)
