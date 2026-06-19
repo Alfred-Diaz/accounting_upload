@@ -15,33 +15,9 @@ DEFAULT_PASSWORD_HASH = "008c70392e3abfbd0fa47bbc2ed96aa99bd49e159727fcba0f2e6ab
 MAIN_HEADERS = ["Posting Date", "Branch", "Description", "Debit", "Credit", "Running Balance", "Check Number"]
 
 BANK_MAPPINGS = {
-    "METROBANK": {
-        "Posting Date": "Posting Date",
-        "Branch/Channel": "Branch",
-        "Transaction Description": "Description",
-        "Debit Amount": "Debit",
-        "Credit Amount": "Credit",
-        "Balance": "Running Balance",
-        "Check Number": "Check Number",
-    },
-    "EASTWEST": {
-        "Value Date": "Posting Date",
-        "Descript": "Branch",
-        "Reference": "Description",
-        "Debit": "Debit",
-        "Credit": "Credit",
-        "Closing Balance": "Running Balance",
-        "Cheque Number": "Check Number",
-    },
-    "BDO": {
-        "Posting Date": "Posting Date",
-        "Branch": "Branch",
-        "Description": "Description",
-        "Debit": "Debit",
-        "Credit": "Credit",
-        "Running Balance": "Running Balance",
-        "Check Number": "Check Number",
-    },
+    "METROBANK": {"Posting Date": "Posting Date", "Branch/Channel": "Branch", "Transaction Description": "Description", "Debit Amount": "Debit", "Credit Amount": "Credit", "Balance": "Running Balance", "Check Number": "Check Number"},
+    "EASTWEST": {"Value Date": "Posting Date", "Descript": "Branch", "Reference": "Description", "Debit": "Debit", "Credit": "Credit", "Closing Balance": "Running Balance", "Cheque Number": "Check Number"},
+    "BDO": {"Posting Date": "Posting Date", "Branch": "Branch", "Description": "Description", "Debit": "Debit", "Credit": "Credit", "Running Balance": "Running Balance", "Check Number": "Check Number"},
 }
 
 
@@ -93,8 +69,7 @@ def get_db():
 
 def init_db():
     conn = get_db()
-    conn.executescript(
-        """
+    conn.executescript("""
         CREATE TABLE IF NOT EXISTS uploads (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             filename TEXT NOT NULL,
@@ -103,7 +78,9 @@ def init_db():
             account_code TEXT,
             uploaded_by TEXT,
             uploaded_at TEXT NOT NULL,
-            row_count INTEGER NOT NULL DEFAULT 0
+            row_count INTEGER NOT NULL DEFAULT 0,
+            inserted_rows INTEGER NOT NULL DEFAULT 0,
+            duplicate_rows INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS transactions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -120,10 +97,15 @@ def init_db():
             credit REAL DEFAULT 0,
             running_balance REAL DEFAULT 0,
             check_number TEXT,
+            row_key TEXT,
             FOREIGN KEY(upload_id) REFERENCES uploads(id)
         );
-        """
-    )
+    """)
+    for sql in ["ALTER TABLE uploads ADD COLUMN inserted_rows INTEGER NOT NULL DEFAULT 0", "ALTER TABLE uploads ADD COLUMN duplicate_rows INTEGER NOT NULL DEFAULT 0", "ALTER TABLE transactions ADD COLUMN row_key TEXT"]:
+        try:
+            conn.execute(sql)
+        except sqlite3.OperationalError:
+            pass
     conn.commit()
     conn.close()
 
@@ -137,6 +119,11 @@ def query_df(sql, params=()):
 
 def canonical_header(value):
     return " ".join(str(value).strip().upper().replace("_", " ").replace("-", " ").split())
+
+
+def make_row_key(values):
+    joined = "|".join("" if pd.isna(v) else str(v).strip() for v in values)
+    return hashlib.sha256(joined.encode("utf-8")).hexdigest()
 
 
 def read_uploaded_file(uploaded_file):
@@ -226,38 +213,44 @@ def consolidate_file(uploaded_file):
     return prepare_accounting_fields(output), missing, detection_results
 
 
+def existing_row_keys():
+    try:
+        df = query_df("SELECT row_key FROM transactions WHERE row_key IS NOT NULL AND row_key != ''")
+        return set(df["row_key"].dropna().astype(str).tolist())
+    except Exception:
+        return set()
+
+
 def save_upload(frame, username):
     conn = get_db()
     first = frame.iloc[0]
-    cursor = conn.execute(
-        "INSERT INTO uploads (filename, bank, account_name, account_code, uploaded_by, uploaded_at, row_count) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (first["Source File"], first["Bank"], first["Account Name"], first["Account Code"], username, datetime.now().isoformat(timespec="seconds"), len(frame)),
-    )
+    known_keys = existing_row_keys()
+    cursor = conn.execute("INSERT INTO uploads (filename, bank, account_name, account_code, uploaded_by, uploaded_at, row_count, inserted_rows, duplicate_rows) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", (first["Source File"], first["Bank"], first["Account Name"], first["Account Code"], username, datetime.now().isoformat(timespec="seconds"), len(frame), 0, 0))
     upload_id = cursor.lastrowid
-    rows = []
+    inserted_rows = 0
+    duplicate_rows = 0
     for _, row in frame.iterrows():
         posting_date = "" if pd.isna(row["Posting Date"]) else row["Posting Date"].strftime("%Y-%m-%d")
-        rows.append((upload_id, row["Bank"], row["Account Name"], row["Account Code"], row["Source File"], posting_date, row["Month"], row["Branch"], row["Description"], float(row["Debit"]), float(row["Credit"]), float(row["Running Balance"]), row["Check Number"]))
-    conn.executemany(
-        "INSERT INTO transactions (upload_id, bank, account_name, account_code, source_file, posting_date, month, branch, description, debit, credit, running_balance, check_number) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        rows,
-    )
+        key_values = [row["Bank"], row["Account Name"], row["Account Code"], row["Source File"], posting_date, row["Branch"], row["Description"], f"{float(row['Debit']):.2f}", f"{float(row['Credit']):.2f}", f"{float(row['Running Balance']):.2f}", row["Check Number"]]
+        row_key = make_row_key(key_values)
+        if row_key in known_keys:
+            duplicate_rows += 1
+            continue
+        known_keys.add(row_key)
+        conn.execute("INSERT INTO transactions (upload_id, bank, account_name, account_code, source_file, posting_date, month, branch, description, debit, credit, running_balance, check_number, row_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (upload_id, row["Bank"], row["Account Name"], row["Account Code"], row["Source File"], posting_date, row["Month"], row["Branch"], row["Description"], float(row["Debit"]), float(row["Credit"]), float(row["Running Balance"]), row["Check Number"], row_key))
+        inserted_rows += 1
+    conn.execute("UPDATE uploads SET inserted_rows = ?, duplicate_rows = ? WHERE id = ?", (inserted_rows, duplicate_rows, upload_id))
     conn.commit()
     conn.close()
+    return inserted_rows, duplicate_rows
 
 
 def consolidated_df():
-    return query_df(
-        """
-        SELECT bank AS Bank, account_name AS 'Account Name', account_code AS 'Account Code', source_file AS 'Source File', posting_date AS 'Posting Date', branch AS Branch, description AS Description, debit AS Debit, credit AS Credit, running_balance AS 'Running Balance', check_number AS 'Check Number', month AS Month
-        FROM transactions
-        ORDER BY posting_date, id
-        """
-    )
+    return query_df("SELECT bank AS Bank, account_name AS 'Account Name', account_code AS 'Account Code', source_file AS 'Source File', posting_date AS 'Posting Date', branch AS Branch, description AS Description, debit AS Debit, credit AS Credit, running_balance AS 'Running Balance', check_number AS 'Check Number', month AS Month FROM transactions ORDER BY posting_date, id")
 
 
 def uploads_df():
-    return query_df("SELECT id AS ID, filename AS Filename, bank AS Bank, account_name AS 'Account Name', account_code AS 'Account Code', uploaded_by AS 'Uploaded By', uploaded_at AS 'Uploaded At', row_count AS Rows FROM uploads ORDER BY id DESC")
+    return query_df("SELECT id AS ID, filename AS Filename, bank AS Bank, account_name AS 'Account Name', account_code AS 'Account Code', uploaded_by AS 'Uploaded By', uploaded_at AS 'Uploaded At', row_count AS Rows, inserted_rows AS 'Inserted Rows', duplicate_rows AS 'Duplicate Rows' FROM uploads ORDER BY id DESC")
 
 
 def filter_text(df, columns, query):
@@ -297,10 +290,7 @@ def recon_df(bank="All", month="All"):
     df = consolidated_df()
     if df.empty:
         return pd.DataFrame()
-    result = df.groupby(["Bank", "Account Name", "Account Code", "Month"], dropna=False).agg(
-        Transactions=("Source File", "count"),
-        **{"Total Debit": ("Debit", "sum"), "Total Credit": ("Credit", "sum"), "Ending Balance": ("Running Balance", "last")},
-    ).reset_index()
+    result = df.groupby(["Bank", "Account Name", "Account Code", "Month"], dropna=False).agg(Transactions=("Source File", "count"), **{"Total Debit": ("Debit", "sum"), "Total Credit": ("Credit", "sum"), "Ending Balance": ("Running Balance", "last")}).reset_index()
     result["Net Movement"] = result["Total Credit"] - result["Total Debit"]
     if bank != "All":
         result = result[result["Bank"] == bank]
@@ -316,16 +306,14 @@ def to_excel_bytes(sheets):
         header_fmt = workbook.add_format({"bold": True, "bg_color": "#D9EAF7", "border": 1})
         money_fmt = workbook.add_format({"num_format": "#,##0.00"})
         for sheet_name, df in sheets.items():
-            safe_sheet_name = sheet_name[:31]
-            df.to_excel(writer, index=False, sheet_name=safe_sheet_name)
-            worksheet = writer.sheets[safe_sheet_name]
+            df.to_excel(writer, index=False, sheet_name=sheet_name[:31])
+            worksheet = writer.sheets[sheet_name[:31]]
             for col_num, col_name in enumerate(df.columns):
                 worksheet.write(0, col_num, col_name, header_fmt)
                 worksheet.set_column(col_num, col_num, max(12, min(35, len(str(col_name)) + 4)))
             for col in ["Debit", "Credit", "Running Balance", "Total Debit", "Total Credit", "Ending Balance", "Net Movement"]:
                 if col in df.columns:
-                    idx = df.columns.get_loc(col)
-                    worksheet.set_column(idx, idx, 16, money_fmt)
+                    worksheet.set_column(df.columns.get_loc(col), df.columns.get_loc(col), 16, money_fmt)
     return buffer.getvalue()
 
 
@@ -338,108 +326,86 @@ def main():
     init_db()
     if not require_login():
         st.stop()
-
     st.title("Accounting System")
     with st.sidebar:
         page = st.radio("Menu", ["Dashboard", "Upload Bank Files", "Bank Consolidation", "Check No. Tracking", "Payment Verification", "Bank Recon", "Settings"])
-
     if page == "Dashboard":
         consolidated = consolidated_df()
         uploads = uploads_df()
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Uploads", len(uploads))
-        col2.metric("Transactions", len(consolidated))
-        col3.metric("Total Debit", f"{consolidated['Debit'].sum():,.2f}" if not consolidated.empty else "0.00")
-        col4.metric("Total Credit", f"{consolidated['Credit'].sum():,.2f}" if not consolidated.empty else "0.00")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Uploads", len(uploads))
+        c2.metric("Transactions", len(consolidated))
+        c3.metric("Total Debit", f"{consolidated['Debit'].sum():,.2f}" if not consolidated.empty else "0.00")
+        c4.metric("Total Credit", f"{consolidated['Credit'].sum():,.2f}" if not consolidated.empty else "0.00")
         st.subheader("Upload History")
         st.dataframe(uploads, use_container_width=True)
         if not consolidated.empty:
             download_button("Download full accounting workbook", {"Consolidated": consolidated, "Payment Verification": payments_df(), "Check Tracking": checks_df(), "Bank Recon": recon_df()}, "accounting_bank_workbook.xlsx", primary=True)
-
     elif page == "Upload Bank Files":
         st.subheader("Upload Bank Files")
+        st.info("Rows are unique. Duplicate transaction rows from repeated uploads are skipped.")
         uploaded_files = st.file_uploader("Upload Excel or CSV bank files", type=["xlsx", "xls", "csv"], accept_multiple_files=True)
         if uploaded_files and st.button("Process and save uploaded files", type="primary"):
-            saved_files = 0
-            saved_rows = 0
-            issues = []
-            detection_summary = []
+            saved_files, inserted_total, duplicate_total = 0, 0, 0
+            issues, detection_summary = [], []
             for file in uploaded_files:
                 try:
                     frame, missing, detection_results = consolidate_file(file)
-                    save_upload(frame, st.session_state.get("username", "Accounting"))
+                    inserted_rows, duplicate_rows = save_upload(frame, st.session_state.get("username", "Accounting"))
                     saved_files += 1
-                    saved_rows += len(frame)
+                    inserted_total += inserted_rows
+                    duplicate_total += duplicate_rows
                     detected_bank = frame["Bank"].iloc[0]
-                    detection_summary.append({"file": file.name, "detected_bank": detected_bank, "account_name": frame["Account Name"].iloc[0], "account_code": frame["Account Code"].iloc[0], "matched_headers": next(item["score"] for item in detection_results if item["bank"] == detected_bank)})
+                    detection_summary.append({"file": file.name, "detected_bank": detected_bank, "rows_in_file": len(frame), "inserted_rows": inserted_rows, "duplicate_rows_skipped": duplicate_rows, "matched_headers": next(item["score"] for item in detection_results if item["bank"] == detected_bank)})
                     if missing:
                         issues.append({"file": file.name, "warning": f"Missing source headers: {', '.join(missing)}"})
                 except Exception as exc:
                     issues.append({"file": file.name, "error": str(exc)})
             if saved_files:
-                st.success(f"Saved {saved_files} file(s) with {saved_rows:,} transaction row(s).")
+                st.success(f"Processed {saved_files} file(s). Inserted {inserted_total:,} unique row(s). Skipped {duplicate_total:,} duplicate row(s).")
             if detection_summary:
                 st.dataframe(pd.DataFrame(detection_summary), use_container_width=True)
             if issues:
                 st.warning("Review these issues:")
                 st.json(issues)
-
     elif page == "Bank Consolidation":
         st.subheader("Bank Consolidation")
         q = st.text_input("Search description, source file, bank, account code, or check number")
         df = filter_text(consolidated_df(), ["Description", "Source File", "Bank", "Account Code", "Check Number"], q)
-        st.caption(f"Showing {len(df):,} transaction(s).")
+        st.caption(f"Showing {len(df):,} transaction(s). Download exports this exact table.")
         st.dataframe(df, use_container_width=True)
-        if not df.empty:
-            download_button("Download consolidated result", {"Consolidated": df}, "bank_consolidated.xlsx")
-
+        download_button("Download Bank Consolidation table", {"Bank Consolidation": df}, "bank_consolidation_table.xlsx", primary=True)
     elif page == "Check No. Tracking":
         st.subheader("Check No. Tracking")
         q = st.text_input("Search by check number, description, source file, bank, or account code")
         df = checks_df(q)
-        st.caption(f"Showing {len(df):,} check transaction(s).")
+        st.caption(f"Showing {len(df):,} check transaction(s). Download exports this exact table.")
         st.dataframe(df, use_container_width=True)
-        if not df.empty:
-            download_button("Download check tracking result", {"Check Tracking": df}, "check_no_tracking.xlsx")
-
+        download_button("Download Check No. Tracking table", {"Check No Tracking": df}, "check_no_tracking_table.xlsx", primary=True)
     elif page == "Payment Verification":
         st.subheader("Payment Verification")
-        st.info("Credit-side transactions only. BDO MAIN = 709. METROBANK = 253. Codes are detected from filename when available.")
+        st.info("Credit-side transactions only. BDO MAIN = 709. METROBANK = 253.")
         all_data = consolidated_df()
-        codes = ["All"]
-        if not all_data.empty:
-            codes += sorted([str(x) for x in all_data["Account Code"].dropna().unique().tolist() if str(x) != ""])
+        codes = ["All"] + (sorted([str(x) for x in all_data["Account Code"].dropna().unique().tolist() if str(x) != ""]) if not all_data.empty else [])
         account_code = st.selectbox("Account code", codes)
         q = st.text_input("Search amount, description, source file, bank, or account")
         df = payments_df(q, account_code)
         st.metric("Total credits found", f"{df['Credit'].sum():,.2f}" if not df.empty else "0.00")
-        st.caption(f"Showing {len(df):,} credit transaction(s).")
         st.dataframe(df, use_container_width=True)
-        if not df.empty:
-            download_button("Download payment verification result", {"Payment Verification": df}, "payment_verification.xlsx")
-
+        download_button("Download payment verification result", {"Payment Verification": df}, "payment_verification.xlsx")
     elif page == "Bank Recon":
         st.subheader("Bank Recon")
         all_data = consolidated_df()
-        banks = ["All"]
-        months = ["All"]
-        if not all_data.empty:
-            banks += sorted(all_data["Bank"].dropna().unique().tolist())
-            months += sorted(all_data["Month"].dropna().unique().tolist())
+        banks = ["All"] + (sorted(all_data["Bank"].dropna().unique().tolist()) if not all_data.empty else [])
+        months = ["All"] + (sorted(all_data["Month"].dropna().unique().tolist()) if not all_data.empty else [])
         col1, col2 = st.columns(2)
-        with col1:
-            bank = st.selectbox("Bank", banks)
-        with col2:
-            month = st.selectbox("Month", months)
+        bank = col1.selectbox("Bank", banks)
+        month = col2.selectbox("Month", months)
         df = recon_df(bank, month)
-        st.caption(f"Showing {len(df):,} recon row(s).")
         st.dataframe(df, use_container_width=True)
-        if not df.empty:
-            download_button("Download bank recon result", {"Bank Recon": df}, "bank_recon.xlsx")
-
+        download_button("Download bank recon result", {"Bank Recon": df}, "bank_recon.xlsx")
     elif page == "Settings":
         st.subheader("Settings")
-        st.write("Secrets format for Streamlit Cloud:")
         st.code('APP_USERNAME = "Accounting"\nAPP_PASSWORD_SHA256 = "008c70392e3abfbd0fa47bbc2ed96aa99bd49e159727fcba0f2e6abeb3a9d601"', language="toml")
 
 
