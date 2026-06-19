@@ -2,6 +2,7 @@ import hashlib
 import hmac
 import io
 import os
+import re
 import sqlite3
 from datetime import datetime
 
@@ -80,6 +81,35 @@ def canon(x):
     return " ".join(str(x).strip().upper().replace("_", " ").replace("-", " ").split())
 
 
+def parse_amount(value, force_positive=False):
+    """Parse bank amount strings such as 1,234.56, PHP 1,234.56, (1,234.56), or 1,234.56-."""
+    if pd.isna(value):
+        return 0.0
+    if isinstance(value, (int, float)):
+        amount = float(value)
+    else:
+        text = str(value).strip()
+        if text in ["", "-", "--", "nan", "None"]:
+            return 0.0
+        negative = False
+        upper_text = text.upper()
+        if "(" in text and ")" in text:
+            negative = True
+        if upper_text.endswith("DR") or text.endswith("-"):
+            negative = True
+        cleaned = upper_text.replace("PHP", "").replace("PHP.", "").replace("PESO", "")
+        cleaned = cleaned.replace("₱", "").replace(" ", "").replace(",", "")
+        cleaned = cleaned.replace("(", "").replace(")", "").replace("CR", "").replace("DR", "")
+        cleaned = cleaned.rstrip("-")
+        match = re.search(r"-?\d+(?:\.\d+)?", cleaned)
+        if not match:
+            return 0.0
+        amount = float(match.group(0))
+        if negative:
+            amount = -abs(amount)
+    return abs(amount) if force_positive else amount
+
+
 def read_file(f):
     f.seek(0)
     if f.name.lower().endswith(".csv"):
@@ -133,8 +163,9 @@ def normalize_upload(f):
     out.insert(2, "Account Code", code)
     out.insert(3, "Source File", f.name)
     out["Posting Date"] = pd.to_datetime(out["Posting Date"], errors="coerce")
-    for c in ["Debit", "Credit", "Running Balance"]:
-        out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0)
+    out["Debit"] = out["Debit"].apply(lambda x: parse_amount(x, force_positive=True))
+    out["Credit"] = out["Credit"].apply(lambda x: parse_amount(x, force_positive=True))
+    out["Running Balance"] = out["Running Balance"].apply(lambda x: parse_amount(x, force_positive=False))
     out["Month"] = out["Posting Date"].dt.to_period("M").astype(str).replace("NaT", "")
     out["Branch"] = out["Branch"].fillna("").astype(str)
     out["Description"] = out["Description"].fillna("").astype(str)
@@ -268,7 +299,7 @@ def main():
             dl("Download full accounting workbook", {"Consolidated": tx, "Payment Verification": payments(), "Check Tracking": checks(), "Bank Recon": recon()}, "accounting_bank_workbook.xlsx", True)
     elif page == "Upload Bank Files":
         st.subheader("Upload Bank Files")
-        st.info("Duplicate checking applies only to debit/check rows. Credit rows are all saved, even when similar.")
+        st.info("Duplicate checking applies only to debit/check rows. Credit rows are all saved, even when similar. Metrobank formatted amounts are parsed automatically.")
         files = st.file_uploader("Upload Excel or CSV bank files", ["xlsx", "xls", "csv"], accept_multiple_files=True)
         if files and st.button("Process and save uploaded files", type="primary"):
             summary = []; issues = []; total_inserted = 0; total_skipped = 0
